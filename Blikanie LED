@@ -1,0 +1,29 @@
+int pressed = 0;
+int lastState = HIGH;
+
+void setup() {
+  pinMode(14, OUTPUT);
+  pinMode(26, INPUT_PULLUP);   // tlačítko na zem
+  Serial.begin(9600);
+}
+
+void loop() {
+  int state = digitalRead(26);
+
+
+  if (state == LOW && lastState == HIGH) {
+
+    if (pressed == 0) {
+      digitalWrite(14, HIGH);
+      pressed = 1;
+    }
+    else if (pressed == 1) {
+      digitalWrite(14, LOW);
+      pressed = 0;
+    }
+
+    delay(20);
+  }
+
+  
+}

@@ -1,0 +1,16 @@
+#include <WiFi.h>
+
+void setup() 
+  { 
+  Serial.begin(9600); 
+  WiFi.begin("soc2019", "socka2019");
+  while(WiFi.status() != WL_CONNECTED) { 
+    delay(250);
+    Serial.print("."); 
+  } 
+
+  Serial.println("WiFi uspesne pripojena!"); 
+  Serial.print("IP adresa: "); 
+  Serial.println(WiFi.localIP()); } 
+    
+void loop() { }

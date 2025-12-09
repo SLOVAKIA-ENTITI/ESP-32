@@ -36,7 +36,11 @@ void setup() {
   MFRC522Debug::PCD_DumpVersionToSerial(mfrc522, Serial);
 
   lcd.clear();
-  lcd.print("Priloz kartu");
+  //lcd.print("Priloz kartu");
+  lcd.setCursor(0,0);
+	lcd.print("    WELCOME!  ");	
+  lcd.setCursor(0,1);
+  lcd.print("SCAN ACCESS CARD");	
 }
 
 void loop() {
@@ -57,20 +61,24 @@ void loop() {
 
   Serial.print("UID: ");
   Serial.println(uidString);
+  lcd.print("UID: ");
   lcd.print(uidString);
 
   // Porovnávanie kariet
   lcd.setCursor(0, 1);
   if (uidString == "130492a5") {
-    lcd.print("Pristup povoleny");
+    //lcd.print("Pristup povoleny");
+    lcd.print(" ACCESS GRANTED ");
     Serial.println("Pristup povoleny");
   } 
   else if (uidString == "03f7f1aa") {
-    lcd.print("Zamietnute");
+    //lcd.print("Pristup odopreny");
+    lcd.print(" ACCESS DENIED! ");
     Serial.println("Karta zamietnuta");
   }
   else {
-    lcd.print("Neznama karta");
+    //lcd.print("Neznama karta");
+    lcd.print("  UNKNOWN CARD     ");
     Serial.println("Neznama karta");
   }
 
@@ -80,5 +88,8 @@ void loop() {
   mfrc522.PCD_StopCrypto1();
 
   lcd.clear();
-  lcd.print("Priloz kartu");
+  lcd.setCursor(0,0);
+	lcd.print("    WELCOME!  ");	
+  lcd.setCursor(0,1);
+  lcd.print("SCAN ACCESS CARD");
 }

@@ -1,0 +1,55 @@
+#include <WiFi.h>
+
+WiFiServer server(80);
+
+String header;
+String stav = "zatvorena";
+
+unsigned long currentTime = millis();
+unsigned long previousTime = 0;
+const long timeoutTime = 2000;
+
+void setup() {
+  Serial.begin(9600);
+
+  WiFi.begin("soc2019", "socka2019");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("WiFi pripojena!");
+  Serial.print("IP adresa: ");
+  Serial.println(WiFi.localIP());
+
+  server.begin();
+}
+
+void loop() {
+  WiFiClient client = server.available();  // aktualizovanie prijatych dat
+
+  if (client)  // ak sa pripojil klient...
+  {
+    currentTime = millis();
+    previousTime = currentTime;
+    Serial.println("Novy klient");
+    String currentLine = "";  // premenna pre prijate data
+
+    while (client.connected() && currentTime - previousTime <= timeoutTime) {
+      currentTime = millis();
+      if (client.available())  // test ci su prijate dake data
+      {
+        char c = client.read();  // nacitanie bajtu z buffera
+        Serial.write(c);
+        header += c;
+
+        if (c == '\n')  // po ENTER je request
+        {
+          if (currentLine.length() == 0)  // ak sa nacital prazdny riadok, odosli potvrdenie o spojeni
+          {
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html");
+            client.println("Connection: close");
+            client.println("");
+
+

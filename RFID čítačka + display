@@ -88,6 +88,7 @@ void loop() {
   mfrc522.PCD_StopCrypto1();
 
   lcd.clear();
+  //lcd.print("Priloz kartu");
   lcd.setCursor(0,0);
 	lcd.print("    WELCOME!  ");	
   lcd.setCursor(0,1);

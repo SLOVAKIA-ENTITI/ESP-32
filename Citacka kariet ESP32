@@ -1,6 +1,7 @@
 /*
   Rui Santos & Sara Santos - Random Nerd Tutorials
   Complete project details at https://RandomNerdTutorials.com/esp32-mfrc522-rfid-reader-arduino/
+  https://randomnerdtutorials.com/esp32-mfrc522-rfid-reader-arduino/
 */
 
 #include <MFRC522v2.h>

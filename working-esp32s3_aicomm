@@ -1,0 +1,434 @@
+/*
+ * ============================================================
+ *  ESP32-S3 AI Voice Assistant
+ *  Board: ESP32-S3 N16R8 + ES8388 expansion board
+ *
+ *  Flow:
+ *    GPIO4 button → I2S mic record → OpenAI Whisper STT
+ *    → Google Gemini AI → VoiceRSS TTS → ES8388 playback
+ * ============================================================
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
+#include <ArduinoJson.h>
+#include <Audio.h>
+#include <Wire.h>
+#include <driver/i2s_std.h>
+#include <driver/i2s_types.h>
+#include "esp_task_wdt.h"
+
+// ============================================================
+//  USER CONFIGURATION
+// ============================================================
+const char* WIFI_SSID      = "wifi_net-cool";
+const char* WIFI_PASSWORD  = "povina401";
+const char* OPENAI_API_KEY = "sk-...";
+const char* GEMINI_API_KEY = "AIza...";
+const char* VOICERSS_KEY   = "YOUR_VOICERSS_KEY";
+
+// ============================================================
+//  PIN DEFINITIONS
+// ============================================================
+#define I2C_SDA_PIN   18
+#define I2C_SCL_PIN   17
+#define I2S_BCLK_PIN  15
+#define I2S_LRCK_PIN  16
+#define I2S_DIN_PIN   45
+#define I2S_DOUT_PIN  35
+#define PA_EN_PIN     21
+#define RECORD_BTN    4    // external button: GPIO4 → GND
+
+// ============================================================
+//  AUDIO / RECORDING SETTINGS
+// ============================================================
+#define SAMPLE_RATE      16000
+#define RECORD_CHANNELS  1
+#define RECORD_BITS      16
+#define MAX_RECORD_SEC   8
+#define BYTES_PER_SAMPLE (RECORD_BITS / 8)
+#define MAX_BUF_BYTES    (SAMPLE_RATE * RECORD_CHANNELS * BYTES_PER_SAMPLE * MAX_RECORD_SEC)
+
+// ============================================================
+//  ES8388 REGISTER MAP
+// ============================================================
+#define ES8388_ADDR         0x10
+#define ES8388_CONTROL1     0x00
+#define ES8388_CONTROL2     0x01
+#define ES8388_CHIPPOWER    0x02
+#define ES8388_ADCPOWER     0x03
+#define ES8388_DACPOWER     0x04
+#define ES8388_ADCCONTROL1  0x09
+#define ES8388_ADCCONTROL2  0x0A
+#define ES8388_ADCCONTROL3  0x0B
+#define ES8388_ADCCONTROL4  0x0C
+#define ES8388_ADCCONTROL5  0x0D
+#define ES8388_ADCCONTROL6  0x0E
+#define ES8388_ADCCONTROL7  0x0F
+#define ES8388_ADCCONTROL10 0x12
+#define ES8388_ADCCONTROL11 0x13
+#define ES8388_DACCONTROL1  0x17
+#define ES8388_DACCONTROL2  0x18
+#define ES8388_DACCONTROL3  0x19
+#define ES8388_DACCONTROL4  0x1A
+#define ES8388_DACCONTROL5  0x1B
+#define ES8388_DACCONTROL7  0x1D
+#define ES8388_DACCONTROL17 0x27
+#define ES8388_DACCONTROL20 0x2A
+#define ES8388_DACCONTROL21 0x2B
+#define ES8388_DACCONTROL23 0x2D
+#define ES8388_DACCONTROL24 0x2E
+#define ES8388_DACCONTROL25 0x2F
+#define ES8388_DACCONTROL26 0x30
+#define ES8388_DACCONTROL27 0x31
+
+// ============================================================
+//  GLOBALS
+// ============================================================
+Audio audio;
+uint8_t* recordBuf    = nullptr;
+size_t   recordedBytes = 0;
+
+enum State { STATE_IDLE, STATE_RECORDING, STATE_PROCESSING, STATE_SPEAKING };
+volatile State currentState = STATE_IDLE;
+
+// ============================================================
+//  ES8388
+// ============================================================
+static bool es_write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(ES8388_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+void initES8388() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(400000);
+
+  es_write(ES8388_CONTROL1,  0x80); delay(20);
+  es_write(ES8388_CONTROL1,  0x00);
+  es_write(ES8388_CONTROL2,  0x00);
+  es_write(ES8388_CHIPPOWER, 0xFF); delay(10);
+  es_write(ES8388_CONTROL1,  0x05);
+  es_write(ES8388_CONTROL2,  0x50);
+  es_write(ES8388_CHIPPOWER, 0xF0);
+
+  es_write(ES8388_DACCONTROL1,  0x18);
+  es_write(ES8388_DACCONTROL2,  0x02);
+  es_write(ES8388_DACCONTROL4,  0x00);
+  es_write(ES8388_DACCONTROL5,  0x00);
+  es_write(ES8388_DACCONTROL3,  0x00);
+  es_write(ES8388_DACCONTROL17, 0x90);
+  es_write(ES8388_DACCONTROL20, 0x90);
+  es_write(ES8388_DACCONTROL21, 0x80);
+  es_write(ES8388_DACCONTROL23, 0x00);
+  es_write(ES8388_DACCONTROL7,  0x04);
+  es_write(ES8388_DACCONTROL24, 0x1E);
+  es_write(ES8388_DACCONTROL25, 0x1E);
+  es_write(ES8388_DACCONTROL26, 0x1E);
+  es_write(ES8388_DACCONTROL27, 0x1E);
+  es_write(ES8388_DACPOWER,     0x3C);
+
+  es_write(ES8388_ADCPOWER,    0x00);
+  es_write(ES8388_ADCCONTROL1, 0x88);
+  es_write(ES8388_ADCCONTROL2, 0x50);
+  es_write(ES8388_ADCCONTROL3, 0x02);
+  es_write(ES8388_ADCCONTROL4, 0x0C);
+  es_write(ES8388_ADCCONTROL5, 0x02);
+  es_write(ES8388_ADCCONTROL10, 0x00);
+  es_write(ES8388_ADCCONTROL11, 0x00);
+  es_write(ES8388_ADCCONTROL6,  0x60);
+  es_write(ES8388_ADCCONTROL7,  0x70);
+  es_write(ES8388_CHIPPOWER,    0x00);
+
+  Serial.println("[ES8388] Initialized.");
+}
+
+// ============================================================
+//  I2S RECORDING (new IDF channel driver, port 1)
+// ============================================================
+static i2s_chan_handle_t rx_chan = nullptr;
+
+void startI2SRecording() {
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+  chan_cfg.auto_clear = true;
+  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_chan));
+
+  i2s_std_config_t std_cfg = {
+    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+    .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)I2S_BCLK_PIN,
+      .ws   = (gpio_num_t)I2S_LRCK_PIN,
+      .dout = I2S_GPIO_UNUSED,
+      .din  = (gpio_num_t)I2S_DOUT_PIN,
+      .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+    },
+  };
+
+  ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &std_cfg));
+  ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+  Serial.println("[I2S] RX started.");
+}
+
+void stopI2SRecording() {
+  if (rx_chan) {
+    i2s_channel_disable(rx_chan);
+    i2s_del_channel(rx_chan);
+    rx_chan = nullptr;
+    Serial.println("[I2S] RX stopped.");
+  }
+}
+
+void recordAudio() {
+  if (!recordBuf) { Serial.println("[ERROR] No buffer!"); return; }
+
+  recordedBytes = 0;
+  startI2SRecording();
+  Serial.println("[REC] Nahravám — drž tlačidlo a hovor...");
+
+  const size_t CHUNK = 1024;
+  while (digitalRead(RECORD_BTN) == LOW) {
+    esp_task_wdt_reset();
+    size_t bytesRead = 0;
+    size_t toRead    = min(CHUNK, MAX_BUF_BYTES - recordedBytes);
+    if (toRead == 0) break;
+    esp_err_t err = i2s_channel_read(rx_chan, recordBuf + recordedBytes,
+                                     toRead, &bytesRead, pdMS_TO_TICKS(100));
+    if (err == ESP_OK) recordedBytes += bytesRead;
+  }
+
+  stopI2SRecording();
+  Serial.printf("[REC] Captured %u bytes (%.1f s)\n", recordedBytes,
+    (float)recordedBytes / (SAMPLE_RATE * RECORD_CHANNELS * BYTES_PER_SAMPLE));
+}
+
+// ============================================================
+//  WAV HEADER
+// ============================================================
+struct WavHeader {
+  char     riff[4]       = {'R','I','F','F'};
+  uint32_t chunkSize;
+  char     wave[4]       = {'W','A','V','E'};
+  char     fmt[4]        = {'f','m','t',' '};
+  uint32_t subChunk1Size = 16;
+  uint16_t audioFormat   = 1;
+  uint16_t numChannels;
+  uint32_t sampleRate;
+  uint32_t byteRate;
+  uint16_t blockAlign;
+  uint16_t bitsPerSample;
+  char     data[4]       = {'d','a','t','a'};
+  uint32_t subChunk2Size;
+  void fill(uint32_t dataBytes, uint16_t ch, uint32_t rate, uint16_t bits) {
+    numChannels = ch; sampleRate = rate; bitsPerSample = bits;
+    blockAlign = ch * (bits/8); byteRate = rate * blockAlign;
+    subChunk2Size = dataBytes; chunkSize = 36 + dataBytes;
+  }
+} __attribute__((packed));
+
+// ============================================================
+//  STT — OpenAI Whisper
+// ============================================================
+String transcribeAudio() {
+  if (recordedBytes < 1000) { Serial.println("[STT] Too short."); return ""; }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  Serial.println("[STT] Connecting to OpenAI...");
+  if (!client.connect("api.openai.com", 443)) { Serial.println("[STT] Failed."); return ""; }
+
+  WavHeader hdr;
+  hdr.fill(recordedBytes, RECORD_CHANNELS, SAMPLE_RATE, RECORD_BITS);
+  uint32_t wavSize = sizeof(WavHeader) + recordedBytes;
+
+  const char* boundary = "----ESP32Boundary";
+  String partHeader = String("--") + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
+    "Content-Type: audio/wav\r\n\r\n";
+  String modelPart = String("\r\n--") + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1"
+    "\r\n--" + boundary + "\r\n"
+    "Content-Disposition: form-data; name=\"language\"\r\n\r\nsk"
+    "\r\n--" + boundary + "--\r\n";
+
+  uint32_t totalLen = partHeader.length() + wavSize + modelPart.length();
+
+  client.printf(
+    "POST /v1/audio/transcriptions HTTP/1.1\r\n"
+    "Host: api.openai.com\r\n"
+    "Authorization: Bearer %s\r\n"
+    "Content-Type: multipart/form-data; boundary=%s\r\n"
+    "Content-Length: %u\r\n"
+    "Connection: close\r\n\r\n",
+    OPENAI_API_KEY, boundary, totalLen);
+
+  client.print(partHeader);
+  client.write((const uint8_t*)&hdr, sizeof(WavHeader));
+  const size_t CHUNK = 2048;
+  for (size_t i = 0; i < recordedBytes; i += CHUNK)
+    client.write(recordBuf + i, min(CHUNK, recordedBytes - i));
+  client.print(modelPart);
+
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+  String body = client.readString();
+  client.stop();
+
+  Serial.println("[STT] Response: " + body);
+  DynamicJsonDocument doc(2048);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) { Serial.println("[STT] Parse error."); return ""; }
+  String text = doc["text"].as<String>();
+  Serial.println("[STT] Transcript: " + text);
+  return text;
+}
+
+// ============================================================
+//  AI — Google Gemini
+// ============================================================
+String askGemini(const String& userText) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  const char* host = "generativelanguage.googleapis.com";
+  Serial.println("[AI] Connecting to Gemini...");
+  if (!client.connect(host, 443)) { Serial.println("[AI] Failed."); return ""; }
+
+  DynamicJsonDocument req(4096);
+  JsonArray contents = req.createNestedArray("contents");
+  JsonObject turn    = contents.createNestedObject();
+  JsonArray parts    = turn.createNestedArray("parts");
+  parts.createNestedObject()["text"] =
+    "Si slovensky hlasovy asistent. Odpovedaj VYHRADNE po slovensky. "
+    "Bud strucny, maximalne 2 kratke vety. Otazka: " + userText;
+  JsonObject genCfg = req.createNestedObject("generationConfig");
+  genCfg["maxOutputTokens"] = 100;
+  genCfg["temperature"]     = 0.7;
+
+  String body; serializeJson(req, body);
+  String url = "/v1beta/models/gemini-1.5-flash:generateContent?key=" + String(GEMINI_API_KEY);
+
+  client.printf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+    url.c_str(), host, body.length());
+  client.print(body);
+
+  while (client.connected()) { String l = client.readStringUntil('\n'); if (l == "\r") break; }
+  String resp = client.readString();
+  client.stop();
+
+  Serial.println("[AI] Response: " + resp);
+  DynamicJsonDocument doc(8192);
+  if (deserializeJson(doc, resp) != DeserializationError::Ok) { Serial.println("[AI] Parse error."); return ""; }
+  String answer = doc["candidates"][0]["content"]["parts"][0]["text"].as<String>();
+  answer.trim();
+  Serial.println("[AI] Answer: " + answer);
+  return answer;
+}
+
+// ============================================================
+//  TTS — VoiceRSS
+// ============================================================
+void speakText(const String& text) {
+  if (text.isEmpty()) return;
+  String encoded = "";
+  for (size_t i = 0; i < text.length(); i++) {
+    char c = text[i];
+    if (isAlphaNumeric(c) || c=='-' || c=='_' || c=='.' || c=='~') encoded += c;
+    else if (c == ' ') encoded += "%20";
+    else { char buf[4]; snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c); encoded += buf; }
+  }
+  String ttsUrl = "http://api.voicerss.org/?key=" + String(VOICERSS_KEY) +
+    "&hl=sk-sk&v=Adela&src=" + encoded + "&c=MP3&f=16khz_16bit_mono";
+  Serial.println("[TTS] Streaming: " + text);
+  if (!audio.connecttohost(ttsUrl.c_str())) Serial.println("[TTS] Failed.");
+}
+
+// ============================================================
+//  AUDIO CALLBACKS
+// ============================================================
+void audio_info(const char* info)  { Serial.print("[AUDIO] ");     Serial.println(info); }
+void audio_error(const char* info) { Serial.print("[AUDIO ERR] "); Serial.println(info); }
+void audio_eof_mp3(const char*)    { Serial.println("[AUDIO] Done."); currentState = STATE_IDLE; }
+void audio_id3data(const char*)    {}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  esp_task_wdt_deinit();
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n========================================");
+  Serial.println("  ESP32-S3 AI Voice Assistant");
+  Serial.println("========================================");
+
+  pinMode(RECORD_BTN, INPUT_PULLUP);
+  pinMode(PA_EN_PIN, OUTPUT);
+  digitalWrite(PA_EN_PIN, HIGH);
+  Serial.println("[PA] Amplifier enabled.");
+
+  if (psramFound()) {
+    recordBuf = (uint8_t*)ps_malloc(MAX_BUF_BYTES);
+    if (recordBuf) Serial.printf("[RAM] PSRAM buffer: %u bytes (%d s max)\n", MAX_BUF_BYTES, MAX_RECORD_SEC);
+    else           Serial.println("[ERROR] PSRAM malloc failed!");
+  } else {
+    Serial.println("[WARN] No PSRAM — using heap.");
+    recordBuf = (uint8_t*)malloc(MAX_BUF_BYTES);
+  }
+
+  initES8388();
+
+  audio.setPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DIN_PIN);
+  audio.setVolume(18);
+
+  Serial.print("[WiFi] Connecting");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
+  Serial.println("\n[READY] Drz tlacidlo GPIO4 a hovor!");
+}
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+  audio.loop();
+
+  switch (currentState) {
+
+    case STATE_IDLE:
+      if (digitalRead(RECORD_BTN) == LOW) {
+        delay(50);
+        if (digitalRead(RECORD_BTN) == LOW) {
+          Serial.println("\n[STATE] RECORDING");
+          currentState = STATE_RECORDING;
+          recordAudio();
+          currentState = STATE_PROCESSING;
+          Serial.println("[STATE] PROCESSING");
+        }
+      }
+      break;
+
+    case STATE_PROCESSING: {
+      String transcript = transcribeAudio();
+      if (transcript.isEmpty()) { Serial.println("[PROC] No transcript."); currentState = STATE_IDLE; break; }
+      String answer = askGemini(transcript);
+      if (answer.isEmpty()) answer = "Prepacte, nerozumel som vam.";
+      currentState = STATE_SPEAKING;
+      Serial.println("[STATE] SPEAKING");
+      speakText(answer);
+      break;
+    }
+
+    case STATE_SPEAKING:
+      break;
+
+    default:
+      break;
+  }
+}

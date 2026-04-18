@@ -1,0 +1,139 @@
+/*
+ * ESP32-S3 Gemini Chat - OPRAVENÁ VERZIA S DIAGNOSTIKOU
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <Audio.h>
+#include <Wire.h>
+
+// ===== KONFIGURÁCIA =====
+const char* ssid = "wifi_net-cool";           
+const char* password = "povina401";      
+const char* geminiApiKey = "AIzaSyAZrL2aIu-HKl1XaPOAvwBbMNGqMcd9wJM"; 
+
+#define I2C_SDA 18
+#define I2C_SCL 17
+#define I2S_DSIN 45
+#define I2S_BCLK 15
+#define I2S_LRCK 16
+#define GPIO_PA_EN 21 
+
+const char* geminiHost = "generativelanguage.googleapis.com";
+const char* geminiModel = "gemini-2.5-flash"; 
+
+Audio audio;
+WebServer server(80);
+
+// --- DIAGNOSTICKÉ CALLBACKY (MUSIA BYŤ TU) ---
+void audio_info(const char *info){ Serial.print("AUDIO_INFO: "); Serial.println(info); }
+void audio_error(const char *info){ Serial.print("AUDIO_ERROR: "); Serial.println(info); }
+void audio_eof_mp3(const char *info){ Serial.println("AUDIO_INFO: Došlo na koniec súboru."); }
+
+void initAudioHardware() {
+  pinMode(GPIO_PA_EN, OUTPUT);
+  digitalWrite(GPIO_PA_EN, HIGH); 
+  delay(100);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  byte addr = 0x10; 
+  auto writeReg = [&](byte reg, byte val) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(val);
+    Wire.endTransmission();
+  };
+
+  writeReg(0x00, 0x80); delay(5);
+  writeReg(0x00, 0x00); 
+  writeReg(0x01, 0x58);
+  writeReg(0x02, 0x00);
+  writeReg(0x04, 0x3c); 
+  writeReg(0x22, 0x1e); 
+  writeReg(0x23, 0x1e); 
+
+  audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DSIN);
+  audio.setVolume(21); 
+  Serial.println("Audio HW pripravený.");
+}
+
+void setupWiFi() {
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
+}
+
+String callGeminiAPI(String userMessage) {
+  WiFiClientSecure client;
+  client.setInsecure(); 
+  if (!client.connect(geminiHost, 443)) return "Chyba pripojenia.";
+
+  String sysInstruction = "Si asistent. Odpovedaj slovensky, velmi stručne (max 10 slov). ";
+  DynamicJsonDocument jsonRequest(8192);
+  JsonArray contents = jsonRequest.createNestedArray("contents");
+  JsonObject content0 = contents.createNestedObject();
+  JsonArray parts = content0.createNestedArray("parts");
+  parts.createNestedObject()["text"] = sysInstruction + userMessage;
+  
+  String requestBody;
+  serializeJson(jsonRequest, requestBody);
+  String url = "/v1beta/models/" + String(geminiModel) + ":generateContent?key=" + String(geminiApiKey);
+  
+  client.print("POST " + url + " HTTP/1.1\r\nHost: " + String(geminiHost) + "\r\nContent-Type: application/json\r\nContent-Length: " + String(requestBody.length()) + "\r\n\r\n" + requestBody);
+
+  while (client.available() == 0) { delay(10); }
+  if (!client.find("{")) return "Chyba API.";
+  DynamicJsonDocument doc(64000); 
+  deserializeJson(doc, "{" + client.readString());
+  return doc["candidates"][0]["content"]["parts"][0]["text"].as<String>();
+}
+
+void handleChat() {
+  if (!server.hasArg("plain")) return;
+  DynamicJsonDocument jsonIn(2048);
+  deserializeJson(jsonIn, server.arg("plain"));
+  String userMessage = jsonIn["message"].as<String>();
+  
+  String geminiResponse = callGeminiAPI(userMessage);
+  Serial.println("Gemini: " + geminiResponse);
+  
+  // OPRAVA: Použitie HTTPS a tw-ob klienta (vyžaduje to stabilnejší stream)
+  String ttsUrl = "https://translate.google.com/translate_tts?ie=UTF-8&q=" + geminiResponse + "&tl=sk&client=tw-ob";
+  ttsUrl.replace(" ", "%20");
+  
+  Serial.println("Štartujem audio stream...");
+  if(!audio.connecttohost(ttsUrl.c_str())) {
+      Serial.println("Chyba: Knižnica neprijala URL.");
+  }
+
+  server.send(200, "application/json", "{\"response\":\"" + geminiResponse + "\"}");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  initAudioHardware();
+  setupWiFi();
+  server.on("/", [](){ server.send(200, "text/html", getHTML()); });
+  server.on("/chat", HTTP_POST, handleChat);
+  server.begin();
+  Serial.println("Pripravený!");
+}
+
+void loop() { 
+  server.handleClient();
+  audio.loop(); 
+}
+
+String getHTML() {
+  return R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="background:#121212;color:white;text-align:center;font-family:sans-serif;">
+<div style="margin-top:20vh;"><h2>S3 Voice AI</h2><input type="text" id="m" style="padding:10px;width:250px;"><br><br>
+<button onclick="s()" style="padding:10px 20px;background:green;color:white;border:none;border-radius:5px;">Hovoriť</button>
+<div id="r" style="margin-top:20px;color:#888;"></div></div>
+<script>async function s(){const m=document.getElementById('m');const r=document.getElementById('r');if(!m.value)return;r.innerText="Premýšľam...";
+const res=await fetch('/chat',{method:'POST',body:JSON.stringify({message:m.value})});const d=await res.json();r.innerText=d.response;m.value='';}</script>
+</body></html>)rawliteral";
+}

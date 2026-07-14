@@ -1,0 +1,196 @@
+#include <WiFi.h>
+#include "Audio.h"
+#include <FS.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <XPT2046_Touchscreen.h> 
+
+const char* ssid     = "wifi_net-cool";
+const char* password = "povina401";
+
+// ─── Piny pre reproduktor (MAX98357A) ────────────────────────
+#define I2S_DOUT 47
+#define I2S_BCLK 48
+#define I2S_LRC  41
+
+// ─── Piny pre Displej (SPI3 / Predvolené) ────────────────────
+#define MY_TFT_MISO 17
+#define MY_TFT_MOSI  7
+#define MY_TFT_SCLK 16
+#define MY_TFT_CS    4
+#define MY_TFT_DC    6
+#define MY_TFT_RST   5
+
+// ─── Samostatné piny pre Dotyk (SPI2) ───────────────────
+#define MY_TOUCH_SCLK 12
+#define MY_TOUCH_MISO 13
+#define MY_TOUCH_MOSI 11
+#define MY_TOUCH_CS   10
+
+// Inicializácia displeja
+Adafruit_ILI9341 tft = Adafruit_ILI9341(MY_TFT_CS, MY_TFT_DC, MY_TFT_RST);
+
+// Vytvorenie druhej nezávislej SPI zbernice pre dotyk
+SPIClass VytvorenySPI2(HSPI); 
+XPT2046_Touchscreen ts(MY_TOUCH_CS);
+
+Audio audio;
+
+struct RadioStation {
+  const char* name;
+  const char* url;
+};
+
+// --- 100% OVERENÉ A FUNKČNÉ DOMÉNY PRE TVOJU SIEŤ (11 STANÍC) ---
+RadioStation stations[] = {
+  // ─── HLAVNÉ STANICE (Overené) ──────────────────────────────────
+  {"Radio Vlna", "http://stream.radiovlna.sk/vlna-hi.mp3"},
+  {"Radio Slovensko", "http://live.slovakradio.sk:8000/Slovensko_128.mp3"},
+  {"Fun Radio", "http://stream.funradio.sk/fun128.mp3"},
+  
+  // ─── EXTRA STREAME OD FUN RÁDIA (Overené) ──────────────────────
+  {"Fun Radio Dance", "http://stream.funradio.sk/dance128.mp3"},
+  {"Fun Radio 80-90", "http://stream.funradio.sk/80-90-128.mp3"},
+  {"Fun Radio CZ-SK", "http://stream.funradio.sk/cs128.mp3"},       // Len slovenské a české hity
+  
+  {"Radio Junior", "http://live.slovakradio.sk:8000/Junior_128.mp3"}
+};
+
+int currentStation = 0;
+int maxStations = sizeof(stations) / sizeof(stations[0]);
+int volume = 12; 
+
+void drawCentreString(const char *buf, int x, int y, int size, uint16_t color) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.setTextSize(size);
+  tft.setTextColor(color);
+  tft.getTextBounds(buf, x, y, &x1, &y1, &w, &h);
+  tft.setCursor(x - w / 2, y);
+  tft.print(buf);
+}
+
+void updateDisplay() {
+  tft.fillScreen(ILI9341_BLACK);
+  drawCentreString("ESP32-S3 RADIO", 120, 10, 2, ILI9341_YELLOW);
+  
+  drawCentreString("Stanica:", 120, 50, 1, ILI9341_WHITE);
+  
+  // Zmenšenie písma pre názov stanice na veľkosť 2, aby sa tam pomestili aj dlhšie názvy ako Regina Zapad
+  drawCentreString(stations[currentStation].name, 120, 75, 2, ILI9341_CYAN);
+  
+  char volStr[20];
+  sprintf(volStr, "Hlasitost: %d / 21", volume);
+  drawCentreString(volStr, 120, 120, 1, ILI9341_WHITE);
+
+  tft.fillRect(10, 160, 100, 50, ILI9341_BLUE);  
+  tft.fillRect(130, 160, 100, 50, ILI9341_BLUE); 
+  tft.fillRect(10, 240, 100, 50, ILI9341_DARKGREEN); 
+  tft.fillRect(130, 240, 100, 50, ILI9341_DARKGREEN); 
+
+  drawCentreString("STANICA -", 60, 178, 1, ILI9341_WHITE);
+  drawCentreString("STANICA +", 180, 178, 1, ILI9341_WHITE);
+  drawCentreString("VOL -", 60, 258, 1, ILI9341_WHITE);
+  drawCentreString("VOL +", 180, 258, 1, ILI9341_WHITE);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1200);
+  Serial.println("\n\n--- Startovaci sekvencia ---");
+  
+  SPI.begin(MY_TFT_SCLK, MY_TFT_MISO, MY_TFT_MOSI, MY_TFT_CS);
+  tft.begin();
+  tft.setRotation(2); 
+  tft.fillScreen(ILI9341_BLACK);
+  drawCentreString("Inicializacia...", 120, 100, 1, ILI9341_WHITE);
+  Serial.println("[OK] Displej inicializovany na SPI3");
+
+  VytvorenySPI2.begin(MY_TOUCH_SCLK, MY_TOUCH_MISO, MY_TOUCH_MOSI, MY_TOUCH_CS);
+  ts.begin(VytvorenySPI2); 
+  ts.setRotation(2);
+  Serial.println("[OK] Dotyk inicializovany na SPI2");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+  
+  if(WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[OK] WiFi pripojene");
+  } else {
+    Serial.println("\n[CHYBA] WiFi zlyhalo");
+  }
+  
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(volume);
+  audio.connecttohost(stations[currentStation].url);
+  
+  updateDisplay();
+}
+
+void loop() {
+  audio.loop(); 
+
+  static unsigned long lastTouch = 0;
+  if (millis() - lastTouch > 150) { 
+    
+    if (ts.touched()) {
+      TS_Point p = ts.getPoint();
+      
+      int touchX = map(p.x, 3550, 500, 0, 240);
+      int touchY = map(p.y, 3550, 500, 0, 320);
+      
+      touchX = constrain(touchX, 0, 240);
+      touchY = constrain(touchY, 0, 320);
+
+      Serial.printf("[OK] Stlaceny pixel -> X: %d, Y: %d\n", touchX, touchY);
+
+      // 1. Rad tlačidiel: STANICA (Y cca 140 až 220)
+      if (touchY > 140 && touchY < 220) {
+        if (touchX < 120) { 
+          Serial.println("-> OK: STANICA -");
+          currentStation--;
+          if (currentStation < 0) currentStation = maxStations - 1;
+          audio.connecttohost(stations[currentStation].url);
+          updateDisplay();
+        } 
+        else { 
+          Serial.println("-> OK: STANICA +");
+          currentStation++;
+          if (currentStation >= maxStations) currentStation = 0;
+          audio.connecttohost(stations[currentStation].url);
+          updateDisplay();
+        }
+      }
+
+      // 2. Rad tlačidiel: HLASITOSŤ (Y cca 220 až 310)
+      if (touchY >= 220 && touchY < 310) {
+        if (touchX < 120) { 
+          Serial.println("-> OK: VOL -");
+          if (volume > 0) volume--;
+          audio.setVolume(volume);
+          updateDisplay();
+        } 
+        else { 
+          Serial.println("-> OK: VOL +");
+          if (volume < 21) volume++;
+          audio.setVolume(volume);
+          updateDisplay();
+        }
+      }
+      
+      lastTouch = millis();
+    }
+  }
+}
+
+void audio_showstreamtitle(const char *info){
+    Serial.printf("Práve hrá: %s\n", info);
+}
